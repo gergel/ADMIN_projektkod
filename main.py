@@ -3,8 +3,9 @@ import time
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"
-SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"
+FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"     # Fő adatbázis
+SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"   # Forgatások
+THIRD_DB_ID = "1f8c9afdd53b801992e5dbf08dbc4957"    # Utómunkák
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -36,12 +37,12 @@ def query_database(database_id):
     return all_results
 
 
-def get_second_db_lookup():
-    results = query_database(SECOND_DB_ID)
+def get_lookup_by_project_code(database_id, field_name):
+    results = query_database(database_id)
     lookup = {}
     for item in results:
         try:
-            code = item["properties"]["Projektkód"]["rich_text"][0]["plain_text"].strip()
+            code = item["properties"][field_name]["rich_text"][0]["plain_text"].strip()
             if code:
                 if code not in lookup:
                     lookup[code] = []
@@ -51,19 +52,19 @@ def get_second_db_lookup():
     return lookup
 
 
-def get_current_relations(entry, relation_field_name="Forgatások"):
+def get_current_relations(entry, field_name):
     try:
-        return [rel["id"] for rel in entry["properties"][relation_field_name]["relation"]]
+        return [rel["id"] for rel in entry["properties"][field_name]["relation"]]
     except (KeyError, TypeError):
         return []
 
 
-def update_relation(first_page_id, second_page_ids):
-    url = f"https://api.notion.com/v1/pages/{first_page_id}"
+def update_relation(page_id, field_name, related_ids):
+    url = f"https://api.notion.com/v1/pages/{page_id}"
     payload = {
         "properties": {
-            "Forgatások": {
-                "relation": [{"id": pid} for pid in second_page_ids]
+            field_name: {
+                "relation": [{"id": pid} for pid in related_ids]
             }
         }
     }
@@ -73,42 +74,50 @@ def update_relation(first_page_id, second_page_ids):
 
 def main():
     print("🔁 Kapcsolatok frissítése indul...")
-    second_lookup = get_second_db_lookup()
-    print(f"📄 Második DB projektkód kulcsok száma: {len(second_lookup)}")
+
+    forgas_lookup = get_lookup_by_project_code(SECOND_DB_ID, "Projektkód")
+    utomunka_lookup = get_lookup_by_project_code(THIRD_DB_ID, "Projektkód")
 
     first_entries = query_database(FIRST_DB_ID)
-    print(f"📄 Első adatbázis sorainak száma: {len(first_entries)}")
-
-    kapcsolt = 0
+    kapcsolt_forg = 0
+    kapcsolt_uto = 0
     kihagyva = 0
 
     for entry in first_entries:
         first_id = entry["id"]
         try:
-            title_property = entry["properties"]["PROJEKTKÓD"]["title"]
-            code = title_property[0]["plain_text"].strip()
+            code = entry["properties"]["PROJEKTKÓD"]["title"][0]["plain_text"].strip()
         except (KeyError, IndexError, TypeError):
             print(f"⚠️ Hibás vagy hiányzó projektkód: {first_id}")
             continue
 
-        if code in second_lookup:
-            ids_to_link = sorted(second_lookup[code])
-            current_ids = sorted(get_current_relations(entry))
-
+        # Forgatások
+        if code in forgas_lookup:
+            ids_to_link = sorted(forgas_lookup[code])
+            current_ids = sorted(get_current_relations(entry, "Forgatások"))
             if ids_to_link != current_ids:
-                success = update_relation(first_id, ids_to_link)
-                if success:
-                    kapcsolt += 1
-                    print(f"✅ Kapcsolat frissítve: {code} → {len(ids_to_link)} elem")
+                if update_relation(first_id, "Forgatások", ids_to_link):
+                    kapcsolt_forg += 1
+                    print(f"🎥 Forgatás frissítve: {code} → {len(ids_to_link)} elem")
                 else:
-                    print(f"❌ Sikertelen frissítés: {code}")
+                    print(f"❌ Forgatás frissítés sikertelen: {code}")
             else:
                 kihagyva += 1
-                print(f"⏭️ Nincs változás: {code}")
-        else:
-            print(f"❗ Nincs egyező Projektkód: {code}")
 
-    print(f"🔚 Frissített kapcsolatok: {kapcsolt}, Kihagyva (nem változott): {kihagyva}")
+        # Utómunkák
+        if code in utomunka_lookup:
+            ids_to_link = sorted(utomunka_lookup[code])
+            current_ids = sorted(get_current_relations(entry, "Utómunkák"))
+            if ids_to_link != current_ids:
+                if update_relation(first_id, "Utómunkák", ids_to_link):
+                    kapcsolt_uto += 1
+                    print(f"🎬 Utómunka frissítve: {code} → {len(ids_to_link)} elem")
+                else:
+                    print(f"❌ Utómunka frissítés sikertelen: {code}")
+            else:
+                kihagyva += 1
+
+    print(f"🔚 Forgatás: {kapcsolt_forg}, Utómunka: {kapcsolt_uto}, Kihagyva (nem változott): {kihagyva}")
 
 
 if __name__ == "__main__":
