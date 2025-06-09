@@ -51,7 +51,7 @@ def update_forgatas_relation(forgatas_id, related_ids):
     url = f"https://api.notion.com/v1/pages/{forgatas_id}"
     payload = {
         "properties": {
-            "PROJEKTKÓD": {
+            "Forgatások": {
                 "relation": related_ids
             }
         }
