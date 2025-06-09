@@ -16,15 +16,15 @@ def query_database(database_id):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     all_results = []
     payload = {}
-    
+
     while True:
         res = requests.post(url, headers=HEADERS, json=payload)
         data = res.json()
-        
+
         if "results" not in data:
-            print("❌ Hiba a lekérdezésnél:", data)
+            print(f"❌ Hiba a lekérdezésnél: {data}")
             break
-        
+
         all_results.extend(data["results"])
 
         if data.get("has_more"):
@@ -39,8 +39,11 @@ def get_second_db_lookup():
     lookup = {}
     for item in results:
         try:
-            code = item["properties"]["Projektkód"]["rich_text"][0]["plain_text"]
-            lookup[code] = item["id"]
+            code = item["properties"]["Projektkód"]["rich_text"][0]["plain_text"].strip()
+            if code:
+                if code not in lookup:
+                    lookup[code] = []
+                lookup[code].append(item["id"])
         except (KeyError, IndexError, TypeError):
             continue
     return lookup
@@ -58,28 +61,36 @@ def update_relation(first_page_id, second_page_ids):
     return res.status_code == 200
 
 def main():
-    print("🔁 Kapcsolatok frissítése...")
+    print("🔁 Kapcsolatok frissítése indul...")
     second_lookup = get_second_db_lookup()
+    print(f"📄 Második DB projektkód kulcsok száma: {len(second_lookup)}")
+
     first_entries = query_database(FIRST_DB_ID)
+    print(f"📄 Első adatbázis sorainak száma: {len(first_entries)}")
+
+    kapcsolt = 0
 
     for entry in first_entries:
         first_id = entry["id"]
         try:
-            # A title mező speciális, így így kell lekérni:
             title_property = entry["properties"]["PROJEKTKÓD"]["title"]
-            code = title_property[0]["plain_text"]
+            code = title_property[0]["plain_text"].strip()
         except (KeyError, IndexError, TypeError):
             print(f"⚠️ Hibás vagy hiányzó projektkód: {first_id}")
             continue
 
         if code in second_lookup:
-            success = update_relation(first_id, [second_lookup[code]])
+            ids_to_link = second_lookup[code]
+            success = update_relation(first_id, ids_to_link)
             if success:
-                print(f"✅ Kapcsolat létrehozva: {code}")
+                kapcsolt += 1
+                print(f"✅ Kapcsolva: {code} → {len(ids_to_link)} elem")
             else:
                 print(f"❌ Sikertelen frissítés: {code}")
         else:
-            print(f"❗ Nincs egyező elem a másik adatbázisban: {code}")
+            print(f"❗ Nincs egyező Projektkód: {code}")
+
+    print(f"🔚 Összesen frissített kapcsolatok: {kapcsolt}")
 
 if __name__ == "__main__":
     while True:
