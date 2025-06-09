@@ -3,95 +3,90 @@ import time
 import requests
 
 NOTION_API_KEY = os.environ["NOTION_API_KEY"]
-FORGATASOK_DB_ID = os.environ["FORGATASOK_DB_ID"]  # 20dc9afdd53b803ea6c0d89c6e2f8c2f
-PROJECTS_DB_ID = os.environ["PROJECTS_DB_ID"]      # 4ab04fc0a82642b6bd01354ae11ea291
+FORGATASOK_DB_ID = os.environ["FORGATASOK_DB_ID"]
+PROJECTS_DB_ID = os.environ["PROJECTS_DB_ID"]
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
+    "Content-Type": "application/json"
 }
 
 def get_all_pages(database_id):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    results = []
+    all_results = []
     has_more = True
     next_cursor = None
 
     while has_more:
-        payload = {"page_size": 100}
+        payload = {}
         if next_cursor:
             payload["start_cursor"] = next_cursor
-
         response = requests.post(url, headers=HEADERS, json=payload)
         data = response.json()
+        all_results.extend(data["results"])
+        has_more = data.get("has_more", False)
+        next_cursor = data.get("next_cursor")
 
-        if "results" in data:
-            results.extend(data["results"])
-            has_more = data.get("has_more", False)
-            next_cursor = data.get("next_cursor")
-        else:
-            print(f"❌ Hiba a lekérdezésnél: {data}")
-            break
+    return all_results
 
-    return results
+def extract_plain_text_from_title(properties):
+    title = properties.get("Projektkód", {}).get("title", [])
+    if title and "plain_text" in title[0]:
+        return title[0]["plain_text"].strip()
+    return None
 
-def extract_title(page, property_name):
-    try:
-        return page["properties"][property_name]["title"][0]["text"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return None
-
-def extract_text(page, property_name):
-    try:
-        return page["properties"][property_name]["rich_text"][0]["text"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return None
+def extract_title_page_id_map(pages):
+    mapping = {}
+    for page in pages:
+        properties = page["properties"]
+        code = extract_plain_text_from_title(properties)
+        if code:
+            mapping.setdefault(code, []).append(page["id"])
+    return mapping
 
 def update_relation(page_id, relation_ids):
     url = f"https://api.notion.com/v1/pages/{page_id}"
     payload = {
         "properties": {
-            "PROJEKTKÓD": {
-                "relation": [{"id": pid} for pid in relation_ids]
+            "Kapcsolódó projekt(ek)": {
+                "relation": [{"id": rel_id} for rel_id in relation_ids]
             }
         }
     }
-    res = requests.patch(url, headers=HEADERS, json=payload)
-    return res.status_code == 200
+    response = requests.patch(url, headers=HEADERS, json=payload)
+    return response.status_code == 200
 
 def main():
-    print("🔍 Keresés indul...")
-
-    forgatasok = get_all_pages(FORGATASOK_DB_ID)
-    print(f"📄 Forgatások száma: {len(forgatasok)}")
+    print("🔁 Keresés indul...")
+    forgasok = get_all_pages(FORGATASOK_DB_ID)
+    print(f"📄 Forgatások száma: {len(forgasok)}")
 
     projektek = get_all_pages(PROJECTS_DB_ID)
+    projektkod_map = extract_title_page_id_map(projektek)
 
-    projektkod_to_id = {}
-    for projekt in projektek:
-        kod = extract_text(projekt, "Projektkód")
-        if kod:
-            projektkod_to_id.setdefault(kod, []).append(projekt["id"])
+    kapcsolt = 0
+    for item in forgasok:
+        page_id = item["id"]
+        properties = item["properties"]
+        kod = extract_plain_text_from_title(properties)
 
-    for page in forgatasok:
-        page_id = page["id"]
-        projektkod = extract_title(page, "Projektkód")
-
-        if not projektkod:
-            print(f"❗ Hiányzó projektkód a {page_id} sorban")
+        if not kod:
+            print(f"❗ Hiányzó Projektkód a {page_id} sorban")
             continue
 
-        matching_ids = projektkod_to_id.get(projektkod)
-        if not matching_ids:
-            print(f"❌ Nincs találat ehhez a projektkódhoz: {projektkod}")
+        if kod not in projektkod_map:
+            print(f"❗ Nincs találat erre a Projektkódra: {kod}")
             continue
 
-        success = update_relation(page_id, matching_ids)
-        if success:
-            print(f"✅ Kapcsolat frissítve: {projektkod} → {len(matching_ids)} elem")
+        siker = update_relation(page_id, projektkod_map[kod])
+        if siker:
+            kapcsolt += 1
+            print(f"✅ Kapcsolat frissítve: {kod}")
         else:
-            print(f"⚠️ Sikertelen frissítés: {projektkod}")
+            print(f"⚠️ Sikertelen frissítés: {kod}")
+
+    print(f"🟢 Összesen frissített kapcsolatok: {kapcsolt}")
 
 if __name__ == "__main__":
     while True:
