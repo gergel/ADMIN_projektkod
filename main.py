@@ -2,57 +2,58 @@ import os
 import time
 import requests
 
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-FORGATASOK_DB_ID = os.environ.get("FORGATASOK_DB_ID")  # 20dc9afdd53b803ea6c0d89c6e2f8c2f
-MASODIK_DB_ID = os.environ.get("MASODIK_DB_ID")        # 4ab04fc0a82642b6bd01354ae11ea291
+NOTION_API_KEY = os.environ["NOTION_API_KEY"]
+FORGATASOK_DB_ID = os.environ["FORGATASOK_DB_ID"]  # 20dc9afdd53b803ea6c0d89c6e2f8c2f
+PROJECTS_DB_ID = os.environ["PROJECTS_DB_ID"]      # 4ab04fc0a82642b6bd01354ae11ea291
 
 HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Authorization": f"Bearer {NOTION_API_KEY}",
     "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
-def query_database_all(database_id):
+def get_all_pages(database_id):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     results = []
-    payload = {}
+    has_more = True
+    next_cursor = None
 
-    while True:
-        res = requests.post(url, headers=HEADERS, json=payload)
-        data = res.json()
-        if "results" not in data:
+    while has_more:
+        payload = {"page_size": 100}
+        if next_cursor:
+            payload["start_cursor"] = next_cursor
+
+        response = requests.post(url, headers=HEADERS, json=payload)
+        data = response.json()
+
+        if "results" in data:
+            results.extend(data["results"])
+            has_more = data.get("has_more", False)
+            next_cursor = data.get("next_cursor")
+        else:
             print(f"❌ Hiba a lekérdezésnél: {data}")
             break
-        results.extend(data["results"])
-        if data.get("has_more"):
-            payload["start_cursor"] = data["next_cursor"]
-        else:
-            break
+
     return results
 
-def get_forgatasok_entries():
-    return query_database_all(FORGATASOK_DB_ID)
+def extract_title(page, property_name):
+    try:
+        return page["properties"][property_name]["title"][0]["text"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
 
-def get_lookup_by_projektkod():
-    second_entries = query_database_all(MASODIK_DB_ID)
-    mapping = {}
-    for entry in second_entries:
-        try:
-            kod = entry["properties"]["Projektkód"]["rich_text"][0]["plain_text"]
-            page_id = entry["id"]
-            if kod not in mapping:
-                mapping[kod] = []
-            mapping[kod].append({"id": page_id})
-        except (KeyError, IndexError, TypeError):
-            continue
-    return mapping
+def extract_text(page, property_name):
+    try:
+        return page["properties"][property_name]["rich_text"][0]["text"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
 
-def update_forgatas_relation(forgatas_id, related_ids):
-    url = f"https://api.notion.com/v1/pages/{forgatas_id}"
+def update_relation(page_id, relation_ids):
+    url = f"https://api.notion.com/v1/pages/{page_id}"
     payload = {
         "properties": {
-            "Forgatások": {
-                "relation": related_ids
+            "PROJEKTKÓD": {
+                "relation": [{"id": pid} for pid in relation_ids]
             }
         }
     }
@@ -61,27 +62,36 @@ def update_forgatas_relation(forgatas_id, related_ids):
 
 def main():
     print("🔍 Keresés indul...")
-    lookup = get_lookup_by_projektkod()
-    forgatasok = get_forgatasok_entries()
+
+    forgatasok = get_all_pages(FORGATASOK_DB_ID)
     print(f"📄 Forgatások száma: {len(forgatasok)}")
 
-    for entry in forgatasok:
-        forgatas_id = entry["id"]
-        try:
-            projektkod = entry["properties"]["Projektkód"]["title"][0]["plain_text"]
-        except (KeyError, IndexError, TypeError):
-            print(f"❗ Hiányzó projektkód a {forgatas_id} sorban")
+    projektek = get_all_pages(PROJECTS_DB_ID)
+
+    projektkod_to_id = {}
+    for projekt in projektek:
+        kod = extract_text(projekt, "Projektkód")
+        if kod:
+            projektkod_to_id.setdefault(kod, []).append(projekt["id"])
+
+    for page in forgatasok:
+        page_id = page["id"]
+        projektkod = extract_title(page, "Projektkód")
+
+        if not projektkod:
+            print(f"❗ Hiányzó projektkód a {page_id} sorban")
             continue
 
-        kapcsolatok = lookup.get(projektkod)
-        if kapcsolatok:
-            success = update_forgatas_relation(forgatas_id, kapcsolatok)
-            if success:
-                print(f"✅ Frissítve: {projektkod} → {len(kapcsolatok)} kapcsolat")
-            else:
-                print(f"⚠️ Sikertelen frissítés: {projektkod}")
+        matching_ids = projektkod_to_id.get(projektkod)
+        if not matching_ids:
+            print(f"❌ Nincs találat ehhez a projektkódhoz: {projektkod}")
+            continue
+
+        success = update_relation(page_id, matching_ids)
+        if success:
+            print(f"✅ Kapcsolat frissítve: {projektkod} → {len(matching_ids)} elem")
         else:
-            print(f"❌ Nincs találat a második adatbázisban: {projektkod}")
+            print(f"⚠️ Sikertelen frissítés: {projektkod}")
 
 if __name__ == "__main__":
     while True:
