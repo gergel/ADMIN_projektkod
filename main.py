@@ -14,8 +14,26 @@ HEADERS = {
 
 def query_database(database_id):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    res = requests.post(url, headers=HEADERS)
-    return res.json().get("results", [])
+    all_results = []
+    payload = {}
+    
+    while True:
+        res = requests.post(url, headers=HEADERS, json=payload)
+        data = res.json()
+        
+        if "results" not in data:
+            print("❌ Hiba a lekérdezésnél:", data)
+            break
+        
+        all_results.extend(data["results"])
+
+        if data.get("has_more"):
+            payload["start_cursor"] = data["next_cursor"]
+        else:
+            break
+
+    return all_results
+
 
 def get_second_db_lookup():
     results = query_database(SECOND_DB_ID)
