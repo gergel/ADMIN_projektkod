@@ -3,8 +3,8 @@ import time
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"     # Ahol a PROJEKTKÓD title
-SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"   # Ahol a Projektkód rich_text
+FORGATASOK_DB_ID = os.environ.get("FORGATASOK_DB_ID")  # 20dc9afdd53b803ea6c0d89c6e2f8c2f
+MASODIK_DB_ID = os.environ.get("MASODIK_DB_ID")        # 4ab04fc0a82642b6bd01354ae11ea291
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -12,46 +12,47 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def query_database(database_id):
+def query_database_all(database_id):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    all_results = []
+    results = []
     payload = {}
-    
+
     while True:
         res = requests.post(url, headers=HEADERS, json=payload)
         data = res.json()
-        
         if "results" not in data:
-            print("❌ Hiba a lekérdezésnél:", data)
+            print(f"❌ Hiba a lekérdezésnél: {data}")
             break
-        
-        all_results.extend(data["results"])
-
+        results.extend(data["results"])
         if data.get("has_more"):
             payload["start_cursor"] = data["next_cursor"]
         else:
             break
+    return results
 
-    return all_results
+def get_forgatasok_entries():
+    return query_database_all(FORGATASOK_DB_ID)
 
-
-def get_second_db_lookup():
-    results = query_database(SECOND_DB_ID)
-    lookup = {}
-    for item in results:
+def get_lookup_by_projektkod():
+    second_entries = query_database_all(MASODIK_DB_ID)
+    mapping = {}
+    for entry in second_entries:
         try:
-            code = item["properties"]["Projektkód"]["rich_text"][0]["plain_text"]
-            lookup[code] = item["id"]
+            kod = entry["properties"]["Projektkód"]["rich_text"][0]["plain_text"]
+            page_id = entry["id"]
+            if kod not in mapping:
+                mapping[kod] = []
+            mapping[kod].append({"id": page_id})
         except (KeyError, IndexError, TypeError):
             continue
-    return lookup
+    return mapping
 
-def update_relation(first_page_id, second_page_ids):
-    url = f"https://api.notion.com/v1/pages/{first_page_id}"
+def update_forgatas_relation(forgatas_id, related_ids):
+    url = f"https://api.notion.com/v1/pages/{forgatas_id}"
     payload = {
         "properties": {
-            "Forgatások": {
-                "relation": [{"id": pid} for pid in second_page_ids]
+            "PROJEKTKÓD": {
+                "relation": related_ids
             }
         }
     }
@@ -59,28 +60,28 @@ def update_relation(first_page_id, second_page_ids):
     return res.status_code == 200
 
 def main():
-    print("🔁 Kapcsolatok frissítése...")
-    second_lookup = get_second_db_lookup()
-    first_entries = query_database(FIRST_DB_ID)
+    print("🔍 Keresés indul...")
+    lookup = get_lookup_by_projektkod()
+    forgatasok = get_forgatasok_entries()
+    print(f"📄 Forgatások száma: {len(forgatasok)}")
 
-    for entry in first_entries:
-        first_id = entry["id"]
+    for entry in forgatasok:
+        forgatas_id = entry["id"]
         try:
-            # A title mező speciális, így így kell lekérni:
-            title_property = entry["properties"]["PROJEKTKÓD"]["title"]
-            code = title_property[0]["plain_text"]
+            projektkod = entry["properties"]["Projektkód"]["title"][0]["plain_text"]
         except (KeyError, IndexError, TypeError):
-            print(f"⚠️ Hibás vagy hiányzó projektkód: {first_id}")
+            print(f"❗ Hiányzó projektkód a {forgatas_id} sorban")
             continue
 
-        if code in second_lookup:
-            success = update_relation(first_id, [second_lookup[code]])
+        kapcsolatok = lookup.get(projektkod)
+        if kapcsolatok:
+            success = update_forgatas_relation(forgatas_id, kapcsolatok)
             if success:
-                print(f"✅ Kapcsolat létrehozva: {code}")
+                print(f"✅ Frissítve: {projektkod} → {len(kapcsolatok)} kapcsolat")
             else:
-                print(f"❌ Sikertelen frissítés: {code}")
+                print(f"⚠️ Sikertelen frissítés: {projektkod}")
         else:
-            print(f"❗ Nincs egyező elem a másik adatbázisban: {code}")
+            print(f"❌ Nincs találat a második adatbázisban: {projektkod}")
 
 if __name__ == "__main__":
     while True:
