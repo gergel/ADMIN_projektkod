@@ -3,8 +3,8 @@ import time
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-FORGATASOK_DB_ID = os.environ.get("20dc9afdd53b803ea6c0d89c6e2f8c2f")  # 20dc9afdd53b803ea6c0d89c6e2f8c2f
-MASODIK_DB_ID = os.environ.get("4ab04fc0a82642b6bd01354ae11ea291")        # 4ab04fc0a82642b6bd01354ae11ea291
+FORGATASOK_DB_ID = os.environ.get("FORGATASOK_DB_ID")  # 20dc9afdd53b803ea6c0d89c6e2f8c2f
+MASODIK_DB_ID = os.environ.get("MASODIK_DB_ID")        # 4ab04fc0a82642b6bd01354ae11ea291
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
