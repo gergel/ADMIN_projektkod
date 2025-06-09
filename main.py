@@ -3,14 +3,15 @@ import time
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"     # Ahol a PROJEKTKÓD title
-SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"   # Ahol a Projektkód rich_text
+FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"
+SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json"
 }
+
 
 def query_database(database_id):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
@@ -34,6 +35,7 @@ def query_database(database_id):
 
     return all_results
 
+
 def get_second_db_lookup():
     results = query_database(SECOND_DB_ID)
     lookup = {}
@@ -48,6 +50,14 @@ def get_second_db_lookup():
             continue
     return lookup
 
+
+def get_current_relations(entry, relation_field_name="Forgatások"):
+    try:
+        return [rel["id"] for rel in entry["properties"][relation_field_name]["relation"]]
+    except (KeyError, TypeError):
+        return []
+
+
 def update_relation(first_page_id, second_page_ids):
     url = f"https://api.notion.com/v1/pages/{first_page_id}"
     payload = {
@@ -60,6 +70,7 @@ def update_relation(first_page_id, second_page_ids):
     res = requests.patch(url, headers=HEADERS, json=payload)
     return res.status_code == 200
 
+
 def main():
     print("🔁 Kapcsolatok frissítése indul...")
     second_lookup = get_second_db_lookup()
@@ -69,6 +80,7 @@ def main():
     print(f"📄 Első adatbázis sorainak száma: {len(first_entries)}")
 
     kapcsolt = 0
+    kihagyva = 0
 
     for entry in first_entries:
         first_id = entry["id"]
@@ -80,17 +92,24 @@ def main():
             continue
 
         if code in second_lookup:
-            ids_to_link = second_lookup[code]
-            success = update_relation(first_id, ids_to_link)
-            if success:
-                kapcsolt += 1
-                print(f"✅ Kapcsolva: {code} → {len(ids_to_link)} elem")
+            ids_to_link = sorted(second_lookup[code])
+            current_ids = sorted(get_current_relations(entry))
+
+            if ids_to_link != current_ids:
+                success = update_relation(first_id, ids_to_link)
+                if success:
+                    kapcsolt += 1
+                    print(f"✅ Kapcsolat frissítve: {code} → {len(ids_to_link)} elem")
+                else:
+                    print(f"❌ Sikertelen frissítés: {code}")
             else:
-                print(f"❌ Sikertelen frissítés: {code}")
+                kihagyva += 1
+                print(f"⏭️ Nincs változás: {code}")
         else:
             print(f"❗ Nincs egyező Projektkód: {code}")
 
-    print(f"🔚 Összesen frissített kapcsolatok: {kapcsolt}")
+    print(f"🔚 Frissített kapcsolatok: {kapcsolt}, Kihagyva (nem változott): {kihagyva}")
+
 
 if __name__ == "__main__":
     while True:
