@@ -3,8 +3,8 @@ import time
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-SOURCE_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"
-TARGET_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"
+FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"
+SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -14,51 +14,53 @@ HEADERS = {
 
 def query_database(database_id):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    response = requests.post(url, headers=HEADERS)
-    return response.json().get("results", [])
+    res = requests.post(url, headers=HEADERS)
+    return res.json().get("results", [])
 
-def extract_project_codes(entries, code_field_name):
-    result = {}
-    for entry in entries:
-        props = entry.get("properties", {})
-        code_data = props.get(code_field_name, {})
-        if code_data.get("type") == "rich_text":
-            texts = code_data.get("rich_text", [])
-            if texts:
-                code = texts[0].get("plain_text", "").strip()
-                result[code] = entry["id"]
-    return result
+def get_second_db_lookup():
+    results = query_database(SECOND_DB_ID)
+    lookup = {}
+    for item in results:
+        try:
+            code = item["properties"]["Projektkód"]["rich_text"][0]["plain_text"]
+            lookup[code] = item["id"]
+        except (KeyError, IndexError, TypeError):
+            continue
+    return lookup
 
-def update_relation(source_page_id, relation_property_name, target_page_id):
-    url = f"https://api.notion.com/v1/pages/{source_page_id}"
+def update_relation(first_page_id, second_page_ids):
+    url = f"https://api.notion.com/v1/pages/{first_page_id}"
     payload = {
         "properties": {
-            relation_property_name: {
-                "relation": [{"id": target_page_id}]
+            "Forgatások": {
+                "relation": [{"id": pid} for pid in second_page_ids]
             }
         }
     }
-    requests.patch(url, headers=HEADERS, json=payload)
+    res = requests.patch(url, headers=HEADERS, json=payload)
+    return res.status_code == 200
 
 def main():
-    print("🔄 Notion szinkronizálás indul...")
-    source_entries = query_database(SOURCE_DB_ID)
-    target_entries = query_database(TARGET_DB_ID)
+    print("🔁 Kapcsolatok frissítése...")
+    second_lookup = get_second_db_lookup()
+    first_entries = query_database(FIRST_DB_ID)
 
-    target_map = extract_project_codes(target_entries, "PROJEKTKÓD")
+    for entry in first_entries:
+        first_id = entry["id"]
+        try:
+            code = entry["properties"]["PROJEKTKÓD"]["rich_text"][0]["plain_text"]
+        except (KeyError, IndexError, TypeError):
+            print(f"⚠️ Hibás vagy hiányzó projektkód: {first_id}")
+            continue
 
-    for entry in source_entries:
-        props = entry.get("properties", {})
-        code_data = props.get("Projektkód", {})
-        if code_data.get("type") == "rich_text":
-            texts = code_data.get("rich_text", [])
-            if texts:
-                code = texts[0].get("plain_text", "").strip()
-                if code in target_map:
-                    update_relation(entry["id"], "id", target_map[code])
-                    print(f"✅ Kapcsolat beállítva: {code}")
-                else:
-                    print(f"⚠️ Nincs találat: {code}")
+        if code in second_lookup:
+            success = update_relation(first_id, [second_lookup[code]])
+            if success:
+                print(f"✅ Kapcsolat létrehozva: {code}")
+            else:
+                print(f"❌ Sikertelen frissítés: {code}")
+        else:
+            print(f"❗ Nincs egyező elem a másik adatbázisban: {code}")
 
 if __name__ == "__main__":
     while True:
