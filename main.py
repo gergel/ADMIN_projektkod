@@ -3,8 +3,8 @@ import time
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"
-SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"
+FIRST_DB_ID = "20dc9afdd53b803ea6c0d89c6e2f8c2f"     # Ahol a PROJEKTKÓD title
+SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"   # Ahol a Projektkód rich_text
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -48,7 +48,9 @@ def main():
     for entry in first_entries:
         first_id = entry["id"]
         try:
-            code = entry["properties"]["PROJEKTKÓD"]["rich_text"][0]["plain_text"]
+            # A title mező speciális, így így kell lekérni:
+            title_property = entry["properties"]["PROJEKTKÓD"]["title"]
+            code = title_property[0]["plain_text"]
         except (KeyError, IndexError, TypeError):
             print(f"⚠️ Hibás vagy hiányzó projektkód: {first_id}")
             continue
