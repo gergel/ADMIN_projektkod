@@ -20,10 +20,12 @@ FAIL_FAST_ON_DB_ERROR = os.environ.get("FAIL_FAST_ON_DB_ERROR", "1") == "1"
 NAME_PROP = os.environ.get("NAME_PROP", "Name")
 DATE_PROP = os.environ.get("DATE_PROP", "Date")
 
-# Notion hívásokhoz
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "600"))
-QUERY_MAX_RETRIES = int(os.environ.get("QUERY_MAX_RETRIES", "5"))
-QUERY_RETRY_BASE_SLEEP = float(os.environ.get("QUERY_RETRY_BASE_SLEEP", "2.0"))  # 2s, 4s, 8s...
+QUERY_MAX_RETRIES = int(os.environ.get("QUERY_MAX_RETRIES", "6"))
+QUERY_RETRY_BASE_SLEEP = float(os.environ.get("QUERY_RETRY_BASE_SLEEP", "2.0"))
+
+# SECOND_DB szűrés chunk méret (hány projektkód legyen 1 query-ben OR filterrel)
+SECOND_DB_CODES_CHUNK = int(os.environ.get("SECOND_DB_CODES_CHUNK", "25"))
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -39,81 +41,79 @@ logger = logging.getLogger("notion-relations-sync")
 
 
 def _sleep_with_jitter(seconds: float):
-    # minimális jitter, hogy ne legyen “thundering herd”
     time.sleep(seconds + (0.1 * seconds))
 
 
-def query_database(database_id):
+def _post_with_retries(url, payload, label):
     """
-    Returns: (results: list, ok: bool)
-    Retries: timeout / 5xx / 429 esetén.
+    Generic POST with retries for timeout/5xx/429.
+    Returns: (response_json, ok)
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            res = requests.post(url, headers=HEADERS, json=payload, timeout=HTTP_TIMEOUT_SECONDS)
+        except requests.RequestException as e:
+            if attempt <= QUERY_MAX_RETRIES:
+                wait_s = QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+                logger.warning("%s request error attempt=%d/%d: %s | retry in %.1fs", label, attempt, QUERY_MAX_RETRIES, e, wait_s)
+                _sleep_with_jitter(wait_s)
+                continue
+            logger.error("%s request error: %s", label, e)
+            return None, False
+
+        if res.status_code == 429:
+            retry_after = res.headers.get("Retry-After")
+            wait_s = float(retry_after) if retry_after else (QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1)))
+            if attempt <= QUERY_MAX_RETRIES:
+                logger.warning("%s rate limited (429) attempt=%d/%d | retry in %.1fs", label, attempt, QUERY_MAX_RETRIES, wait_s)
+                _sleep_with_jitter(wait_s)
+                continue
+            body = (res.text or "")[:500]
+            logger.error("%s failed (429) body=%s", label, body)
+            return None, False
+
+        if 500 <= res.status_code <= 599:
+            if attempt <= QUERY_MAX_RETRIES:
+                wait_s = QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+                logger.warning("%s server error status=%s attempt=%d/%d | retry in %.1fs", label, res.status_code, attempt, QUERY_MAX_RETRIES, wait_s)
+                _sleep_with_jitter(wait_s)
+                continue
+            body = (res.text or "")[:500]
+            logger.error("%s failed status=%s body=%s", label, res.status_code, body)
+            return None, False
+
+        if res.status_code != 200:
+            body = (res.text or "")[:500]
+            logger.error("%s failed status=%s body=%s", label, res.status_code, body)
+            return None, False
+
+        try:
+            return res.json(), True
+        except ValueError:
+            logger.error("%s invalid JSON response", label)
+            return None, False
+
+
+def query_database(database_id, filter_payload=None):
+    """
+    Returns: (results, ok)
+    filter_payload: Notion database query filter dict, pl:
+      {"property": "Projektkód", "rich_text": {"equals": "ABC"}}
+      or {"or": [ ... ]}
     """
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     all_results = []
     payload = {}
+    if filter_payload:
+        payload["filter"] = filter_payload
 
     while True:
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                res = requests.post(
-                    url,
-                    headers=HEADERS,
-                    json=payload,
-                    timeout=HTTP_TIMEOUT_SECONDS,
-                )
-            except requests.RequestException as e:
-                if attempt <= QUERY_MAX_RETRIES:
-                    wait_s = QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
-                    logger.warning(
-                        "DB query request error (db=%s) attempt=%d/%d: %s | retry in %.1fs",
-                        database_id, attempt, QUERY_MAX_RETRIES, e, wait_s
-                    )
-                    _sleep_with_jitter(wait_s)
-                    continue
-                logger.error("DB query request error (db=%s): %s", database_id, e)
-                return [], False
+        data, ok = _post_with_retries(url, payload, label=f"DB query (db={database_id})")
+        if not ok:
+            return [], False
 
-            # Rate limit
-            if res.status_code == 429:
-                retry_after = res.headers.get("Retry-After")
-                wait_s = float(retry_after) if retry_after else (QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1)))
-                if attempt <= QUERY_MAX_RETRIES:
-                    logger.warning(
-                        "DB query rate limited (429) (db=%s) attempt=%d/%d | retry in %.1fs",
-                        database_id, attempt, QUERY_MAX_RETRIES, wait_s
-                    )
-                    _sleep_with_jitter(wait_s)
-                    continue
-                body = (res.text or "")[:500]
-                logger.error("DB query failed (429) (db=%s) body=%s", database_id, body)
-                return [], False
-
-            # 5xx -> retry
-            if 500 <= res.status_code <= 599:
-                if attempt <= QUERY_MAX_RETRIES:
-                    wait_s = QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
-                    logger.warning(
-                        "DB query server error (db=%s) status=%s attempt=%d/%d | retry in %.1fs",
-                        database_id, res.status_code, attempt, QUERY_MAX_RETRIES, wait_s
-                    )
-                    _sleep_with_jitter(wait_s)
-                    continue
-                body = (res.text or "")[:500]
-                logger.error("DB query failed (db=%s) status=%s body=%s", database_id, res.status_code, body)
-                return [], False
-
-            # 4xx (nem 429) -> no retry
-            if res.status_code != 200:
-                body = (res.text or "")[:500]
-                logger.error("DB query failed (db=%s) status=%s body=%s", database_id, res.status_code, body)
-                return [], False
-
-            # success
-            break
-
-        data = res.json()
         results = data.get("results")
         if results is None:
             logger.error("DB query invalid response (db=%s): %s", database_id, str(data)[:500])
@@ -161,34 +161,9 @@ def _extract_date(props, prop_name):
 
 def get_name_and_date(entry):
     props = entry.get("properties", {}) or {}
-
-    name = _extract_title(props, NAME_PROP)
-    if not name:
-        name = _extract_rich_text(props, NAME_PROP)
-
-    date = _extract_date(props, DATE_PROP)
-
-    if not name:
-        name = "<no name>"
-    if not date:
-        date = "<no date>"
-
+    name = _extract_title(props, NAME_PROP) or _extract_rich_text(props, NAME_PROP) or "<no name>"
+    date = _extract_date(props, DATE_PROP) or "<no date>"
     return name, date
-
-
-def get_second_db_lookup():
-    results, ok = query_database(SECOND_DB_ID)
-    lookup = {}
-
-    for item in results:
-        try:
-            code = item["properties"]["Projektkód"]["rich_text"][0]["plain_text"].strip()
-            if code:
-                lookup.setdefault(code, []).append(item["id"])
-        except (KeyError, IndexError, TypeError):
-            continue
-
-    return lookup, ok
 
 
 def get_current_relations(entry, relation_field_name="Forgatások"):
@@ -214,12 +189,63 @@ def update_relation(first_page_id, second_page_ids):
         logger.error("Update request error (page=%s): %s", first_page_id, e)
         return False
 
+    if res.status_code == 429 or 500 <= res.status_code <= 599:
+        # Itt is lehetne retry, de ritkán kell; ha szeretnéd, beletesszük.
+        body = (res.text or "")[:500]
+        logger.error("Update failed transient (page=%s) status=%s body=%s", first_page_id, res.status_code, body)
+        return False
+
     if res.status_code != 200:
         body = (res.text or "")[:500]
         logger.error("Update failed (page=%s) status=%s body=%s", first_page_id, res.status_code, body)
         return False
 
     return True
+
+
+def chunked(seq, n):
+    buf = []
+    for x in seq:
+        buf.append(x)
+        if len(buf) >= n:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+
+def build_second_db_lookup_for_codes(codes):
+    """
+    SECOND_DB lookup csak a FIRST_DB-ben előforduló kódokra.
+    Így nem kell a teljes SECOND_DB-t letölteni (ami nálad 504-hez vezet).
+    """
+    lookup = {}
+    codes = [c for c in codes if c]
+
+    if not codes:
+        return lookup, True
+
+    for group in chunked(codes, SECOND_DB_CODES_CHUNK):
+        # OR filter: bármelyik Projektkód egyezzen
+        filter_payload = {
+            "or": [
+                {"property": "Projektkód", "rich_text": {"equals": code}}
+                for code in group
+            ]
+        }
+        results, ok = query_database(SECOND_DB_ID, filter_payload=filter_payload)
+        if not ok:
+            return {}, False
+
+        for item in results:
+            try:
+                code = item["properties"]["Projektkód"]["rich_text"][0]["plain_text"].strip()
+                if code:
+                    lookup.setdefault(code, []).append(item["id"])
+            except (KeyError, IndexError, TypeError):
+                continue
+
+    return lookup, True
 
 
 def main():
@@ -229,17 +255,33 @@ def main():
 
     logger.info("Kapcsolatok frissítése indul...")
 
-    second_lookup, ok2 = get_second_db_lookup()
-    if not ok2 and FAIL_FAST_ON_DB_ERROR:
-        logger.error("Második DB lekérdezés sikertelen -> fail fast (nem fut tovább 0 találattal).")
-        return
-    logger.info("Második DB projektkód kulcsok száma: %d", len(second_lookup))
-
+    # 1) FIRST_DB először (ebből tudjuk, milyen kódokra kell keresni)
     first_entries, ok1 = query_database(FIRST_DB_ID)
     if not ok1 and FAIL_FAST_ON_DB_ERROR:
         logger.error("Első DB lekérdezés sikertelen -> fail fast.")
         return
     logger.info("Első adatbázis sorainak száma: %d", len(first_entries))
+
+    # Kódok kigyűjtése
+    codes_needed = set()
+    bad_code_peek = 0
+    for entry in first_entries:
+        try:
+            title_property = entry["properties"]["PROJEKTKÓD"]["title"]
+            code = (title_property[0]["plain_text"] or "").strip()
+            if code:
+                codes_needed.add(code)
+        except (KeyError, IndexError, TypeError):
+            bad_code_peek += 1
+
+    logger.info("Egyedi PROJEKTKÓD-ok száma az első DB-ben: %d (hibás kód előfordulás: %d)", len(codes_needed), bad_code_peek)
+
+    # 2) SECOND_DB lookup csak ezekre a kódokra (sokkal könnyebb query)
+    second_lookup, ok2 = build_second_db_lookup_for_codes(sorted(codes_needed))
+    if not ok2 and FAIL_FAST_ON_DB_ERROR:
+        logger.error("Második DB lekérdezés sikertelen -> fail fast.")
+        return
+    logger.info("Második DB lookup kulcsok száma: %d", len(second_lookup))
 
     updated = 0
     unchanged = 0
@@ -265,7 +307,6 @@ def main():
         ids = second_lookup.get(code)
         if not ids:
             no_match += 1
-            logger.debug("Nincs egyező Projektkód: %s", code)
         else:
             ids_to_link = sorted(ids)
             current_ids = sorted(get_current_relations(entry))
