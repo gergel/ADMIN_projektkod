@@ -22,6 +22,14 @@ PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", "200"))
 # Opcionális: nagyon pörgős környezetben minimális lassítás ciklusonként (0 = kikapcsol)
 PER_ITEM_SLEEP_MS = int(os.environ.get("PER_ITEM_SLEEP_MS", "0"))
 
+# Ha a DB query elhasal (timeout, 500, stb), akkor inkább ne fusson tovább 0 találattal
+FAIL_FAST_ON_DB_ERROR = os.environ.get("FAIL_FAST_ON_DB_ERROR", "1") == "1"
+
+# Melyik property-kből vegyük ki a "Name" és "Date" értékeket a loghoz
+# (Állítsd Notion property névre, ha nálad máshogy hívják.)
+NAME_PROP = os.environ.get("NAME_PROP", "Name")
+DATE_PROP = os.environ.get("DATE_PROP", "Date")
+
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": NOTION_VERSION,
@@ -36,6 +44,10 @@ logger = logging.getLogger("notion-relations-sync")
 
 
 def query_database(database_id):
+    """
+    Returns: (results: list, ok: bool)
+    ok=False, ha request hiba / nem-200 / invalid response.
+    """
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     all_results = []
     payload = {}
@@ -45,18 +57,18 @@ def query_database(database_id):
             res = requests.post(url, headers=HEADERS, json=payload, timeout=60)
         except requests.RequestException as e:
             logger.error("DB query request error (db=%s): %s", database_id, e)
-            break
+            return [], False
 
         if res.status_code != 200:
             body = (res.text or "")[:500]
             logger.error("DB query failed (db=%s) status=%s body=%s", database_id, res.status_code, body)
-            break
+            return [], False
 
         data = res.json()
         results = data.get("results")
         if results is None:
             logger.error("DB query invalid response (db=%s): %s", database_id, str(data)[:500])
-            break
+            return [], False
 
         all_results.extend(results)
 
@@ -65,11 +77,65 @@ def query_database(database_id):
         else:
             break
 
-    return all_results
+    return all_results, True
+
+
+def _extract_title(props, prop_name):
+    try:
+        arr = props[prop_name]["title"]
+        if not arr:
+            return ""
+        return (arr[0].get("plain_text") or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _extract_rich_text(props, prop_name):
+    try:
+        arr = props[prop_name]["rich_text"]
+        if not arr:
+            return ""
+        return (arr[0].get("plain_text") or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _extract_date(props, prop_name):
+    try:
+        d = props[prop_name]["date"]
+        if not d:
+            return ""
+        # start tipikusan YYYY-MM-DD vagy ISO datetime
+        return (d.get("start") or "").strip()
+    except (KeyError, TypeError):
+        return ""
+
+
+def get_name_and_date(entry):
+    """
+    Próbálja kinyerni a Name és Date értékeket a megadott property nevekből.
+    - Name: először title-ként, ha nem megy, rich_text-ként.
+    - Date: Notion date típus.
+    """
+    props = entry.get("properties", {}) or {}
+
+    name = _extract_title(props, NAME_PROP)
+    if not name:
+        name = _extract_rich_text(props, NAME_PROP)
+
+    date = _extract_date(props, DATE_PROP)
+
+    # Ha üres, adjunk valami olvasható fallback-et
+    if not name:
+        name = "<no name>"
+    if not date:
+        date = "<no date>"
+
+    return name, date
 
 
 def get_second_db_lookup():
-    results = query_database(SECOND_DB_ID)
+    results, ok = query_database(SECOND_DB_ID)
     lookup = {}
 
     for item in results:
@@ -80,7 +146,7 @@ def get_second_db_lookup():
         except (KeyError, IndexError, TypeError):
             continue
 
-    return lookup
+    return lookup, ok
 
 
 def get_current_relations(entry, relation_field_name="Forgatások"):
@@ -121,10 +187,18 @@ def main():
 
     logger.info("Kapcsolatok frissítése indul...")
 
-    second_lookup = get_second_db_lookup()
+    # 2. DB lookup
+    second_lookup, ok2 = get_second_db_lookup()
+    if not ok2 and FAIL_FAST_ON_DB_ERROR:
+        logger.error("Második DB lekérdezés sikertelen -> fail fast (nem fut tovább 0 találattal).")
+        return
     logger.info("Második DB projektkód kulcsok száma: %d", len(second_lookup))
 
-    first_entries = query_database(FIRST_DB_ID)
+    # 1. DB entries
+    first_entries, ok1 = query_database(FIRST_DB_ID)
+    if not ok1 and FAIL_FAST_ON_DB_ERROR:
+        logger.error("Első DB lekérdezés sikertelen -> fail fast.")
+        return
     logger.info("Első adatbázis sorainak száma: %d", len(first_entries))
 
     updated = 0
@@ -138,13 +212,16 @@ def main():
     for i, entry in enumerate(first_entries, start=1):
         first_id = entry.get("id", "<unknown>")
 
+        # Projektkód
         try:
             title_property = entry["properties"]["PROJEKTKÓD"]["title"]
-            code = title_property[0]["plain_text"].strip()
+            code = (title_property[0]["plain_text"] or "").strip()
         except (KeyError, IndexError, TypeError):
             bad_code += 1
-            # csak figyelmeztetés, de nem minden rekordnál fog történni
-            logger.warning("Hibás vagy hiányzó projektkód (page=%s)", first_id)
+            name, date = get_name_and_date(entry)
+            # Itt a lényeg: ne ID-t logoljunk, hanem Name + Date
+            logger.warning('Hibás vagy hiányzó projektkód (Name="%s", Date="%s")', name, date)
+            logger.debug("Page id (debug): %s", first_id)
             continue
 
         ids = second_lookup.get(code)
@@ -165,7 +242,7 @@ def main():
                 unchanged += 1
                 logger.debug("Nincs változás: %s", code)
 
-        # Ritkított progress log, hogy ne legyen log spam
+        # Ritkított progress log
         if PROGRESS_EVERY > 0 and i % PROGRESS_EVERY == 0:
             logger.info(
                 "Progress: %d/%d | frissítve=%d | nem változott=%d | nincs egyezés=%d | hibás kód=%d | update hiba=%d",
