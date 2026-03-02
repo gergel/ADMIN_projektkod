@@ -10,25 +10,20 @@ SECOND_DB_ID = "4ab04fc0a82642b6bd01354ae11ea291"
 
 NOTION_VERSION = os.environ.get("NOTION_VERSION", "2022-06-28")
 
-# Railway-en élesben hagyd INFO-n. Ha részletes kell: DEBUG.
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-
-# 5 perc default, de állítható env-ből
 SLEEP_SECONDS = int(os.environ.get("SLEEP_SECONDS", "300"))
-
-# Ritkított progress log: ennyi elem feldolgozása után ír 1 sort (0 = kikapcsol)
 PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", "200"))
-
-# Opcionális: nagyon pörgős környezetben minimális lassítás ciklusonként (0 = kikapcsol)
 PER_ITEM_SLEEP_MS = int(os.environ.get("PER_ITEM_SLEEP_MS", "0"))
 
-# Ha a DB query elhasal (timeout, 500, stb), akkor inkább ne fusson tovább 0 találattal
 FAIL_FAST_ON_DB_ERROR = os.environ.get("FAIL_FAST_ON_DB_ERROR", "1") == "1"
 
-# Melyik property-kből vegyük ki a "Name" és "Date" értékeket a loghoz
-# (Állítsd Notion property névre, ha nálad máshogy hívják.)
 NAME_PROP = os.environ.get("NAME_PROP", "Name")
 DATE_PROP = os.environ.get("DATE_PROP", "Date")
+
+# Notion hívásokhoz
+HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "600"))
+QUERY_MAX_RETRIES = int(os.environ.get("QUERY_MAX_RETRIES", "5"))
+QUERY_RETRY_BASE_SLEEP = float(os.environ.get("QUERY_RETRY_BASE_SLEEP", "2.0"))  # 2s, 4s, 8s...
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -43,26 +38,80 @@ logging.basicConfig(
 logger = logging.getLogger("notion-relations-sync")
 
 
+def _sleep_with_jitter(seconds: float):
+    # minimális jitter, hogy ne legyen “thundering herd”
+    time.sleep(seconds + (0.1 * seconds))
+
+
 def query_database(database_id):
     """
     Returns: (results: list, ok: bool)
-    ok=False, ha request hiba / nem-200 / invalid response.
+    Retries: timeout / 5xx / 429 esetén.
     """
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     all_results = []
     payload = {}
 
     while True:
-        try:
-            res = requests.post(url, headers=HEADERS, json=payload, timeout=60)
-        except requests.RequestException as e:
-            logger.error("DB query request error (db=%s): %s", database_id, e)
-            return [], False
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                res = requests.post(
+                    url,
+                    headers=HEADERS,
+                    json=payload,
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                )
+            except requests.RequestException as e:
+                if attempt <= QUERY_MAX_RETRIES:
+                    wait_s = QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+                    logger.warning(
+                        "DB query request error (db=%s) attempt=%d/%d: %s | retry in %.1fs",
+                        database_id, attempt, QUERY_MAX_RETRIES, e, wait_s
+                    )
+                    _sleep_with_jitter(wait_s)
+                    continue
+                logger.error("DB query request error (db=%s): %s", database_id, e)
+                return [], False
 
-        if res.status_code != 200:
-            body = (res.text or "")[:500]
-            logger.error("DB query failed (db=%s) status=%s body=%s", database_id, res.status_code, body)
-            return [], False
+            # Rate limit
+            if res.status_code == 429:
+                retry_after = res.headers.get("Retry-After")
+                wait_s = float(retry_after) if retry_after else (QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1)))
+                if attempt <= QUERY_MAX_RETRIES:
+                    logger.warning(
+                        "DB query rate limited (429) (db=%s) attempt=%d/%d | retry in %.1fs",
+                        database_id, attempt, QUERY_MAX_RETRIES, wait_s
+                    )
+                    _sleep_with_jitter(wait_s)
+                    continue
+                body = (res.text or "")[:500]
+                logger.error("DB query failed (429) (db=%s) body=%s", database_id, body)
+                return [], False
+
+            # 5xx -> retry
+            if 500 <= res.status_code <= 599:
+                if attempt <= QUERY_MAX_RETRIES:
+                    wait_s = QUERY_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+                    logger.warning(
+                        "DB query server error (db=%s) status=%s attempt=%d/%d | retry in %.1fs",
+                        database_id, res.status_code, attempt, QUERY_MAX_RETRIES, wait_s
+                    )
+                    _sleep_with_jitter(wait_s)
+                    continue
+                body = (res.text or "")[:500]
+                logger.error("DB query failed (db=%s) status=%s body=%s", database_id, res.status_code, body)
+                return [], False
+
+            # 4xx (nem 429) -> no retry
+            if res.status_code != 200:
+                body = (res.text or "")[:500]
+                logger.error("DB query failed (db=%s) status=%s body=%s", database_id, res.status_code, body)
+                return [], False
+
+            # success
+            break
 
         data = res.json()
         results = data.get("results")
@@ -105,18 +154,12 @@ def _extract_date(props, prop_name):
         d = props[prop_name]["date"]
         if not d:
             return ""
-        # start tipikusan YYYY-MM-DD vagy ISO datetime
         return (d.get("start") or "").strip()
     except (KeyError, TypeError):
         return ""
 
 
 def get_name_and_date(entry):
-    """
-    Próbálja kinyerni a Name és Date értékeket a megadott property nevekből.
-    - Name: először title-ként, ha nem megy, rich_text-ként.
-    - Date: Notion date típus.
-    """
     props = entry.get("properties", {}) or {}
 
     name = _extract_title(props, NAME_PROP)
@@ -125,7 +168,6 @@ def get_name_and_date(entry):
 
     date = _extract_date(props, DATE_PROP)
 
-    # Ha üres, adjunk valami olvasható fallback-et
     if not name:
         name = "<no name>"
     if not date:
@@ -167,7 +209,7 @@ def update_relation(first_page_id, second_page_ids):
     }
 
     try:
-        res = requests.patch(url, headers=HEADERS, json=payload, timeout=60)
+        res = requests.patch(url, headers=HEADERS, json=payload, timeout=HTTP_TIMEOUT_SECONDS)
     except requests.RequestException as e:
         logger.error("Update request error (page=%s): %s", first_page_id, e)
         return False
@@ -187,14 +229,12 @@ def main():
 
     logger.info("Kapcsolatok frissítése indul...")
 
-    # 2. DB lookup
     second_lookup, ok2 = get_second_db_lookup()
     if not ok2 and FAIL_FAST_ON_DB_ERROR:
         logger.error("Második DB lekérdezés sikertelen -> fail fast (nem fut tovább 0 találattal).")
         return
     logger.info("Második DB projektkód kulcsok száma: %d", len(second_lookup))
 
-    # 1. DB entries
     first_entries, ok1 = query_database(FIRST_DB_ID)
     if not ok1 and FAIL_FAST_ON_DB_ERROR:
         logger.error("Első DB lekérdezés sikertelen -> fail fast.")
@@ -212,14 +252,12 @@ def main():
     for i, entry in enumerate(first_entries, start=1):
         first_id = entry.get("id", "<unknown>")
 
-        # Projektkód
         try:
             title_property = entry["properties"]["PROJEKTKÓD"]["title"]
             code = (title_property[0]["plain_text"] or "").strip()
         except (KeyError, IndexError, TypeError):
             bad_code += 1
             name, date = get_name_and_date(entry)
-            # Itt a lényeg: ne ID-t logoljunk, hanem Name + Date
             logger.warning('Hibás vagy hiányzó projektkód (Name="%s", Date="%s")', name, date)
             logger.debug("Page id (debug): %s", first_id)
             continue
@@ -235,14 +273,11 @@ def main():
             if ids_to_link != current_ids:
                 if update_relation(first_id, ids_to_link):
                     updated += 1
-                    logger.debug("Kapcsolat frissítve: %s → %d elem", code, len(ids_to_link))
                 else:
                     update_failed += 1
             else:
                 unchanged += 1
-                logger.debug("Nincs változás: %s", code)
 
-        # Ritkított progress log
         if PROGRESS_EVERY > 0 and i % PROGRESS_EVERY == 0:
             logger.info(
                 "Progress: %d/%d | frissítve=%d | nem változott=%d | nincs egyezés=%d | hibás kód=%d | update hiba=%d",
